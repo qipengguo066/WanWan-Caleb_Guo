@@ -204,5 +204,31 @@
     return { text: out, fixed, failed: pending.map(u => u.why), units: units.length }
   }
 
-  window.ProseGuard = { styleRule, polishText, count, findHits, maskQuotes, isEnabled, setEnabled }
+  // ---------- 剥离“思考链泄漏” ----------
+  // 有些模型（或中转站的某些模型）会把推理过程直接写进回复，如 <thinking>…</thinking>，
+  // 里面还可能自己写好几版草稿（包括草稿状态栏）。这里把它们清掉，只留最终正文。
+  //   opts.anchor：正文固定的开头标记（如 /<status>/i）。传了的话，开头标记之前的多余文字也会丢掉。
+  const THINK_TAGS = 'thinking|think|thought|thoughts|reasoning|reflection|analysis|scratchpad|inner_thoughts|思考|思考过程|推理|草稿'
+  function stripThinking(text, opts) {
+    let t = String(text || '')
+    // 1. 成对的思考标签：整块删除
+    t = t.replace(new RegExp('<(' + THINK_TAGS + ')(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>', 'gi'), '')
+    // 2. 只有结束标签、没有开始标签（开头的思考没写标签）：丢掉结束标签之前的所有内容
+    const close = new RegExp('<\\/(' + THINK_TAGS + ')\\s*>', 'i').exec(t)
+    if (close) t = t.slice(close.index + close[0].length)
+    // 3. 只有开始标签、没有结束标签（思考没写完就被截断）：从开始标签起丢到末尾，宁可空也不让草稿漏出去
+    const open = new RegExp('<(' + THINK_TAGS + ')(?:\\s[^>]*)?>', 'i').exec(t)
+    if (open) t = t.slice(0, open.index)
+    // 4. 正文有固定开头时，开头标记之前的客套话/残留一律丢掉
+    const anchor = opts && opts.anchor
+    if (anchor) {
+      let re
+      try { re = new RegExp(anchor.source, (anchor.flags || '').replace(/[gy]/g, '')) } catch (_) { re = null }
+      const m = re && re.exec(t)
+      if (m && m.index > 0 && t.slice(0, m.index).trim()) t = t.slice(m.index)
+    }
+    return t.trim()
+  }
+
+  window.ProseGuard = { styleRule, polishText, count, findHits, maskQuotes, stripThinking, isEnabled, setEnabled }
 })()

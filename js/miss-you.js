@@ -2504,7 +2504,11 @@ ${summary}
   }
 
   function cleanOfflineReply(raw) {
-    return stripOfflineLabel(String(raw || '')
+    // 先清掉模型泄漏的思考链（<thinking>…</thinking> 及其中的草稿），并丢掉 <status> 之前的多余文字
+    const unleaked = window.ProseGuard && window.ProseGuard.stripThinking
+      ? window.ProseGuard.stripThinking(raw, { anchor: /<status>/i })
+      : raw
+    return stripOfflineLabel(String(unleaked || '')
       .trim()
       .replace(/^```(?:text|markdown)?\s*/i, '')
       .replace(/```$/i, ''))
