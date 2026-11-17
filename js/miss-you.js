@@ -1728,17 +1728,33 @@ ${memoryCtx}`
     list.innerHTML = buildMissBeautyPresetRows(selected, presets)
   }
 
+  let _missSettingsOpening = false
+
   async function openMissSettingsPage(chatPage, ownerUid, chat, mode) {
+    // 防止连点打开两个页面
+    if (_missSettingsOpening) return
+    _missSettingsOpening = true
+    try {
+      await openMissSettingsPageInner(chatPage, ownerUid, chat, mode)
+    } finally {
+      _missSettingsOpening = false
+    }
+  }
+
+  async function openMissSettingsPageInner(chatPage, ownerUid, chat, mode) {
     const existing = document.getElementById('miss-you-settings-page')
     if (existing) existing.remove()
-    const char = await window.getCharacter(chat.charId)
+    // 这几项互不依赖，并行读取；最慢的“Token 预估”不再等它，页面先打开，预估稍后补上
+    const [char, settings, beautyPresets, usersRaw, records] = await Promise.all([
+      window.getCharacter(chat.charId),
+      getOfflineSettings(ownerUid, chat.id, mode),
+      getMissBeautyPresets(),
+      db.characters.where('type').equals('user').toArray(),
+      getMeetRecords(ownerUid, chat.id, chat.charId, mode)
+    ])
     const display = await getWechatDisplayFor(ownerUid, char)
-    const settings = await getOfflineSettings(ownerUid, chat.id, mode)
-    const beautyPresets = await getMissBeautyPresets()
-    const promptEstimate = await estimateOfflinePromptContext(ownerUid, chat, mode)
-    const users = (await db.characters.where('type').equals('user').toArray())
-      .sort((a, b) => (b.id || 0) - (a.id || 0))
-    const records = await getMeetRecords(ownerUid, chat.id, chat.charId, mode)
+    const users = usersRaw.sort((a, b) => (b.id || 0) - (a.id || 0))
+    const promptEstimate = null // 先显示“计算中…”
     const page = document.createElement('div')
     page.id = 'miss-you-settings-page'
     page.className = 'full-page miss-page'
@@ -1913,6 +1929,16 @@ ${memoryCtx}`
     })
     bindMeetRecordRows(page, ownerUid, chat, mode)
     window.openPage(page)
+    // 页面已经出来了，再慢慢算 Token 预估，算完替换掉“计算中…”
+    estimateOfflinePromptContext(ownerUid, chat, mode).then(summary => {
+      const slot = page.querySelector('.cs-token-estimate')
+      if (!page.isConnected || !slot) return
+      slot.outerHTML = window._wechatCallHelpers.buildPromptContextEstimateHTML(summary)
+    }).catch(e => {
+      console.warn('[miss-you] Token 预估失败', e)
+      const note = page.querySelector('.cs-token-estimate .cs-token-estimate-note')
+      if (note) note.textContent = '预估失败，不影响使用'
+    })
   }
 
   function downloadMissBeautyPreset(preset) {
