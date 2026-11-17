@@ -786,7 +786,8 @@ ${icityProseRule('note')}· 不要输出任何双花括号包裹的模板占位�
   }
 
   function cleanICityDiaryText(raw) {
-    let text = String(raw || '').trim()
+    // 先清掉模型泄漏的思考链（<thinking>…</thinking> 等），没加载 prose-guard 时原样处理
+    let text = (window.ProseGuard && window.ProseGuard.stripThinking ? window.ProseGuard.stripThinking(raw) : String(raw || '')).trim()
     text = text.replace(/^```[a-z]*\s*/i, '').replace(/\s*```$/, '').trim()
     // 兼容少数模型仍然返回 JSON 的情况
     if (text.startsWith('{')) {
@@ -823,7 +824,7 @@ ${icityProseRule('note')}· 不要输出任何双花括号包裹的模板占位�
 
   function parseICityNoteLines(raw) {
     const entries = []
-    String(raw || '').split(/\r?\n/).forEach(line => {
+    ;(window.ProseGuard && window.ProseGuard.stripThinking ? window.ProseGuard.stripThinking(raw) : String(raw || '')).split(/\r?\n/).forEach(line => {
       const text = line.trim()
       if (!text) return
       let m = text.match(/^回复\s*[#＃\[【]?\s*(\d+)\s*[\]】]?\s*[：:]\s*(.+)$/)
