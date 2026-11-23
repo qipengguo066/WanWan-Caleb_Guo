@@ -21442,12 +21442,27 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
   const userDesc = window._wechatUser?.description || '(未设定)'
   const currentRelationText = helpers.buildCurrentRelationText?.(char) || '(未设定)'
 
+  _callPrepStep = '读取聊天历史'
   const historyLimit = await helpers.getChatHistoryLimit?.(chatId) || 100
   const context = await helpers.buildWechatReplyContext?.(chatId, charId, historyLimit) || { textHistory: [], loreMessages: [] }
+  _callPrepStep = '读取世界书'
   const loreCtx = await helpers.getChatLorebookContext?.(chatId, charId, context.loreMessages) || ''
-  const memoryCtx = window.WanWanMemory?.getMemoryContext
-    ? await window.WanWanMemory.getMemoryContext(chatId, charId, window._wechatUid, context.loreMessages)
-    : ''
+  _callPrepStep = '长期记忆检索'
+  let memoryCtx = ''
+  if (window.WanWanMemory?.getMemoryContext) {
+    try {
+      // 向量最多等 5 秒，超时自动改用本地打分；整体再兜底 8 秒，仍不行就这次先不带记忆
+      memoryCtx = await withCallTimeout(
+        window.WanWanMemory.getMemoryContext(chatId, charId, window._wechatUid, context.loreMessages, { embeddingTimeoutMs: 5000 }),
+        8000, '记忆检索超时'
+      )
+    } catch (e) {
+      console.warn('[call] 记忆检索失败，这次通话先不带记忆', e)
+      window.toast?.('长期记忆检索较慢，这次通话先不带记忆')
+      memoryCtx = ''
+    }
+  }
+  _callPrepStep = '读取双语/时区设置'
   const bilingualSettings = await helpers.getChatBilingualSettings?.(chatId) || {}
   const tzStored = await db.config.get(`chatTimezone_${chatId}`)
   const tzConfig = tzStored?.value || {}
@@ -21466,10 +21481,13 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'voice', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  _callPrepStep = '语音标签'
   const ttsTagHintVoice = await getTTSTagHint('call', charName)
   if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
+  _callPrepStep = '日程'
   const scheduleCtxVoice = await getScheduleContext()
   if (scheduleCtxVoice) prompt += scheduleCtxVoice + '\n\n'
+  _callPrepStep = '角色日程'
   const charSchedVoice = await getCharScheduleContext(chatId, charName)
   if (charSchedVoice) prompt += charSchedVoice + '\n\n'
 
@@ -21488,12 +21506,27 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
   const userDesc = window._wechatUser?.description || '(未设定)'
   const currentRelationText = helpers.buildCurrentRelationText?.(char) || '(未设定)'
 
+  _callPrepStep = '读取聊天历史'
   const historyLimit = await helpers.getChatHistoryLimit?.(chatId) || 100
   const context = await helpers.buildWechatReplyContext?.(chatId, charId, historyLimit) || { textHistory: [], loreMessages: [] }
+  _callPrepStep = '读取世界书'
   const loreCtx = await helpers.getChatLorebookContext?.(chatId, charId, context.loreMessages) || ''
-  const memoryCtx = window.WanWanMemory?.getMemoryContext
-    ? await window.WanWanMemory.getMemoryContext(chatId, charId, window._wechatUid, context.loreMessages)
-    : ''
+  _callPrepStep = '长期记忆检索'
+  let memoryCtx = ''
+  if (window.WanWanMemory?.getMemoryContext) {
+    try {
+      // 向量最多等 5 秒，超时自动改用本地打分；整体再兜底 8 秒，仍不行就这次先不带记忆
+      memoryCtx = await withCallTimeout(
+        window.WanWanMemory.getMemoryContext(chatId, charId, window._wechatUid, context.loreMessages, { embeddingTimeoutMs: 5000 }),
+        8000, '记忆检索超时'
+      )
+    } catch (e) {
+      console.warn('[call] 记忆检索失败，这次通话先不带记忆', e)
+      window.toast?.('长期记忆检索较慢，这次通话先不带记忆')
+      memoryCtx = ''
+    }
+  }
+  _callPrepStep = '读取双语/时区设置'
   const bilingualSettings = await helpers.getChatBilingualSettings?.(chatId) || {}
   const tzStored = await db.config.get(`chatTimezone_${chatId}`)
   const tzConfig = tzStored?.value || {}
@@ -21512,10 +21545,13 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'video', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  _callPrepStep = '语音标签'
   const ttsTagHintVideo = await getTTSTagHint('call', charName)
   if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
+  _callPrepStep = '日程'
   const scheduleCtxVideo = await getScheduleContext()
   if (scheduleCtxVideo) prompt += scheduleCtxVideo + '\n\n'
+  _callPrepStep = '角色日程'
   const charSchedVideo = await getCharScheduleContext(chatId, charName)
   if (charSchedVideo) prompt += charSchedVideo + '\n\n'
 
@@ -21855,9 +21891,11 @@ function removeCallTypingIndicator(el) {
 }
 
 
+let _callPrepStep = '' // 记录"准备通话资料"当前走到哪一步，超时时写进提示
+
 function withCallTimeout(promise, ms, msg) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(msg)), ms)
+    const timer = setTimeout(() => reject(new Error(msg + (_callPrepStep ? '（卡在：' + _callPrepStep + '）' : ''))), ms)
     Promise.resolve(promise).then(
       v => { clearTimeout(timer); resolve(v) },
       e => { clearTimeout(timer); reject(e) }
