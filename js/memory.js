@@ -992,7 +992,7 @@ ${text}`
     return isValidTimestamp(sourceAt) ? sourceAt : null
   }
 
-  async function getMemoryContext(chatId, charId, ownerUid, recentMessages) {
+  async function getMemoryContext(chatId, charId, ownerUid, recentMessages, opts) {
     if (!db.memories || !ownerUid || !chatId || !charId) return ''
     var settings = await getSettings(chatId)
     if (!settings.enabled) return ''
@@ -1003,7 +1003,21 @@ ${text}`
     var queryText = (recentMessages || []).map(function(m) { return m.content || '' }).join(' ')
     var queryEmbedding = null
     if (settings.embeddingEnabled && rows.some(function(m) { return Array.isArray(m.embedding) })) {
-      try { queryEmbedding = await createEmbedding(String(queryText || '').slice(-1500) || '当前聊天') }
+      try {
+        var embPromise = createEmbedding(String(queryText || '').slice(-1500) || '当前聊天')
+        var embWait = opts && opts.embeddingTimeoutMs > 0 ? Number(opts.embeddingTimeoutMs) : 0
+        if (embWait) {
+          embPromise.catch(function() {}) // 超时后被放弃的请求，失败也不报未处理错误
+          queryEmbedding = await Promise.race([
+            embPromise,
+            new Promise(function(_, reject) {
+              setTimeout(function() { reject(new Error('查询向量超过 ' + Math.round(embWait / 1000) + ' 秒')) }, embWait)
+            })
+          ])
+        } else {
+          queryEmbedding = await embPromise
+        }
+      }
       catch (e) { console.warn('[memory] 查询向量失败，降级检索：', e) }
     }
     var scored = rows.map(function(m) {
