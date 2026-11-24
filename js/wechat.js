@@ -21201,7 +21201,7 @@ async function recoverCallDraft() {
         initiator: draft.initiator || 'user', duration, messages: msgs, msgTime: endAt
       })
       if (merged) {
-              triggerCallMemory(draft.chatId, draft.charId, draft.ownerUid, callRecordId)
+              triggerCallMemory(draft.chatId, draft.charId, draft.ownerUid, draft.resumeRecordId)
       window.toast?.('上次没挂断的通话已自动保存')
         if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
         await clearCallDraft()
