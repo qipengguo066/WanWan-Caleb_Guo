@@ -713,6 +713,19 @@ function parsePhoneSnapshotJsonLoose(raw) {
     (end > start ? tryParse(repairPhoneJsonLoose(text.slice(start))) : null)
 }
 
+// 清掉模型泄漏的思考链（<think>…</think> 等）。自带一份，不依赖 prose-guard.js 是否已部署
+function stripPhoneThinking(raw) {
+  if (window.ProseGuard && window.ProseGuard.stripThinking) return window.ProseGuard.stripThinking(raw)
+  const TAGS = 'thinking|think|thought|thoughts|reasoning|reflection|analysis|scratchpad|inner_thoughts|思考|思考过程|推理|草稿'
+  let t = String(raw || '').replace(new RegExp('[＜<]\\s*(\\/?)\\s*(' + TAGS + ')\\s*[＞>]', 'gi'), '<$1$2>')
+  t = t.replace(new RegExp('<(' + TAGS + ')(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>', 'gi'), '')
+  const c = new RegExp('<\\/(' + TAGS + ')\\s*>', 'i').exec(t)
+  if (c) t = t.slice(c.index + c[0].length)
+  const o = new RegExp('<(' + TAGS + ')(?:\\s[^>]*)?>', 'i').exec(t)
+  if (o) t = t.slice(0, o.index)
+  return t.trim()
+}
+
 async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
   if (typeof window.callAI !== 'function') throw new Error('请先在设置里配置 API')
   const buildSystem = PHONE_GEN_APP_SYSTEM_BUILDERS[appId]
@@ -735,11 +748,13 @@ async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
   const system = buildSystem(char, user)
   let userPrompt = await buildPhoneAppUserPrompt(appId, char, user, npcs, loreCtx, recentBlock.text, wechatSnapshot?.data)
   if (appId === 'schedule') userPrompt = (await buildPhoneScheduleExtraBlock(charId)) + userPrompt
-  const raw = await window.callAI([{ role: 'user', content: userPrompt }], {
+  const rawOut = await window.callAI([{ role: 'user', content: userPrompt }], {
     system,
     responseFormat: 'json_object',
     temperature: await getPhoneSnapshotTemperature()
   })
+  // 先清掉思考链再找 JSON，否则思考里的 { 会被当成 JSON 开头
+  const raw = stripPhoneThinking(rawOut)
   let parsed = null
   try { parsed = extractPhoneSnapshotJson(raw) } catch (_) {}
   if (!parsed) parsed = parsePhoneSnapshotJsonLoose(raw)
