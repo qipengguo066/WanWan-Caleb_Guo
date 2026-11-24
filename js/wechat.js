@@ -7708,12 +7708,29 @@ function getCallRecordLines(record) {
     if (message?.role !== 'assistant' && message?.role !== 'user') continue
     const spoken = getCallRecordSpokenText(message)
     if (!spoken.text) continue
-    lines.push({ role: message.role, text: spoken.text })
+    lines.push({ role: message.role, text: spoken.text, ts: Number(message.timestamp) || 0 })
   }
   return lines
 }
 window.getCallRecordLines = getCallRecordLines
 
+// 还没挂断的通话：把目前为止的内容给日记等功能读（挂断后就由正式通话记录接手）
+window.getInProgressCallLines = async function (chatId) {
+  try {
+    if (_callState === 'idle' || !_callStartTime || Number(_callChatId) !== Number(chatId)) return null
+    const lines = getCallRecordLines({ messages: _callHistory })
+    if (!lines.length) return null
+    const sec = Math.max(0, Math.floor((Date.now() - _callStartTime) / 1000))
+    const duration = `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
+    return {
+      type: _callType === 'video' ? '视频通话' : '语音通话',
+      initiator: _callInitiator,
+      startTime: _callStartTime,
+      duration,
+      lines
+    }
+  } catch (e) { return null }
+}
 // 给一批聊天消息，返回 Map(消息id → {type, duration, initiator, lines})
 window.getCallLinesForMessages = async function (chatId, msgs) {
   const out = new Map()
