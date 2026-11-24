@@ -523,12 +523,21 @@
         const call = callMap.get(m.id)
         if (call) {
           items.push({ ts, source: 'call', role: 'system', speaker: '系统', content: `【${call.type}开始，${call.initiator === 'char' ? '角色发起' : '用户发起'}，时长${call.duration}】` })
-          call.lines.forEach(l => items.push({ ts, source: 'call', role: l.role, content: l.text }))
+          call.lines.forEach(l => items.push({ ts: l.ts ? icityTs(l.ts) : ts, source: 'call', role: l.role, content: l.text }))
           items.push({ ts, source: 'call', role: 'system', speaker: '系统', content: `【${call.type}结束】` })
           return
         }
         items.push({ ts, source: 'online', role: m.role, content: m.content })
       })
+      // 还没挂断的通话：读到写日记这一刻为止
+      try {
+        const live = window.getInProgressCallLines ? await window.getInProgressCallLines(chat.id) : null
+        if (live && live.lines.length) {
+          const now = Date.now()
+          items.push({ ts: live.startTime, source: 'call', role: 'system', speaker: '系统', content: `【${live.type}进行中，${live.initiator === 'char' ? '角色发起' : '用户发起'}，已通话${live.duration}，写这篇日记时还没有挂断】` })
+          live.lines.forEach(l => items.push({ ts: l.ts ? icityTs(l.ts) : now, source: 'call', role: l.role, content: l.text }))
+        }
+      } catch (_) {}
       const offline = await db.offlineChats.where('charId').equals(base.friendId).toArray()
       offline
         .filter(m => Number(m.ownerUid) === Number(base.ownerUid) && Number(m.chatId) === Number(chat.id) && m.mode !== 'script')
