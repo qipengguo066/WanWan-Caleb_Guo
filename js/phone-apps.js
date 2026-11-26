@@ -20,7 +20,7 @@ const PHONE_GEN_APP_LABELS = {
   'game-center': 'Game Center',
   privacy: '隐私空间',
   mail: 'Mail',
-  schedule: '日程'
+  schedule: '日程',
   x: 'X'
 }
 
