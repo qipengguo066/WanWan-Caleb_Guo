@@ -2395,7 +2395,7 @@ async function generateXPhoneSnapshot(ownerUid, charId) {
   var agos = parsed.feed.map(function() { return xRand(3, 900) }).sort(function(a, b) { return a - b })
   parsed.feed.forEach(function(it, i) { it.ago = agos[i]; it.ts = now - agos[i] * 60000; it.batch = now })
   parsed.likes.forEach(function(it) { it.ago = xRand(1500, 30000); it.ts = now - it.ago * 60000; it.batch = now })
-  parsed.drafts.forEach(function(it) { it.ago = xRand(60, 6000) })
+  parsed.drafts.forEach(function(it) { it.ago = xRand(60, 6000); it.ts = now - it.ago * 60000; it.batch = now })
 
   // 推荐流 / 点赞：新内容合并进旧内容，不覆盖
   var feedAll = xPhoneMergeList(parsed.feed.slice(0, 16), xPhoneKeepOld(prevD && prevD.feed, prevGen))
@@ -2432,7 +2432,7 @@ async function generateXPhoneSnapshot(ownerUid, charId) {
       feed: feedAll,
       likes: likesAll,
       follows: parsed.follows.slice(0, 14),
-      drafts: parsed.drafts.slice(0, 6),
+      drafts: xPhoneMergeList(parsed.drafts.slice(0, 6), xPhoneKeepOld(prevD && prevD.drafts, prevGen)),
       alt: altOut
     }
   }
