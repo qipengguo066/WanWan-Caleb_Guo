@@ -210,7 +210,8 @@
   //   opts.anchor：正文固定的开头标记（如 /<status>/i）。传了的话，开头标记之前的多余文字也会丢掉。
   const THINK_TAGS = 'thinking|think|thought|thoughts|reasoning|reflection|analysis|scratchpad|inner_thoughts|思考|思考过程|推理|草稿'
   function stripThinking(text, opts) {
-    let t = String(text || '')
+    // 0. 先把全角括号、带空格的写法（＜think＞、< think >）统一成 <think>
+    let t = String(text || '').replace(new RegExp('[＜<]\\s*(\\/?)\\s*(' + THINK_TAGS + ')\\s*[＞>]', 'gi'), '<$1$2>')
     // 1. 成对的思考标签：整块删除
     t = t.replace(new RegExp('<(' + THINK_TAGS + ')(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>', 'gi'), '')
     // 2. 只有结束标签、没有开始标签（开头的思考没写标签）：丢掉结束标签之前的所有内容
