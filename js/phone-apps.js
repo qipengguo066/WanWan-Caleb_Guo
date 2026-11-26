@@ -20,8 +20,8 @@ const PHONE_GEN_APP_LABELS = {
   'game-center': 'Game Center',
   privacy: '隐私空间',
   mail: 'Mail',
-  schedule: '日程'
-  X: 'X'
+  schedule: '日程',
+  x: 'X'
 }
 
 window.PHONE_GEN_APP_LABELS = PHONE_GEN_APP_LABELS
@@ -800,7 +800,7 @@ const PHONE_APP_PAGE_IDS = [
   'phone-app-mail-page',
   'phone-app-mail-detail-page',
   'phone-app-schedule-page',
-  'phone-app-X-page'
+  'phone-app-x-page'
 ]
 
 function closePhoneAppSnapshotPages() {
@@ -1494,7 +1494,7 @@ const PHONE_GEN_APP_OPENERS = {
   privacy: openPhonePrivacyPage,
   mail: openPhoneMailPage,
   schedule: openPhoneSchedulePage,
-  X: ctx => window.openPhoneXPage?.(ctx)
+  x: ctx => window.openPhoneXPage?.(ctx)
 }
 
 async function openPhoneAppPage(appId, context) {
