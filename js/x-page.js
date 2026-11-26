@@ -335,7 +335,7 @@ function xSkewLikes() {
 }
 
 function xCleanHandle(h) {
-  var s = stripXAt(h).replace(/[^A-Za-z0-9_]/g, '').slice(0, 15)
+  var s = stripXAt(h).replace(/[^A-Za-z0-9_]/g, '').slice(0, 30)
   return s || ('user' + xRand(1000, 99999))
 }
 
@@ -1176,14 +1176,14 @@ function showXAccountEdit(charId) {
     bodyHTML:
       '<div class="x-sheet-form">' +
         '<label>昵称<input class="x-sheet-input" id="x-acc-name" maxlength="14" value="' + xEscape(acc.name) + '"></label>' +
-        '<label>用户名<input class="x-sheet-input" id="x-acc-handle" maxlength="15" autocapitalize="off" autocorrect="off" spellcheck="false" value="' + xEscape(acc.handle) + '"></label>' +
+        '<label>用户名<input class="x-sheet-input" id="x-acc-handle" maxlength="30" autocapitalize="off" autocorrect="off" spellcheck="false" value="' + xEscape(acc.handle) + '"></label>' +
         '<div class="x-sheet-hint">用户名只能用英文、数字、下划线。保存后，该角色的旧帖子和评论会一起更新。</div>' +
       '</div>',
     items: [{
       label: '保存', icon: 'fa-solid fa-check',
       onClick: function() {
         var name = xCleanName(mask.querySelector('#x-acc-name').value, acc.name)
-        var handle = stripXAt(mask.querySelector('#x-acc-handle').value).replace(/[^A-Za-z0-9_]/g, '').slice(0, 15) || acc.handle
+        var handle = stripXAt(mask.querySelector('#x-acc-handle').value).replace(/[^A-Za-z0-9_]/g, '').slice(0, 30) || acc.handle
         data.accounts[key] = { name: name, handle: handle }
         data.posts.forEach(function(p) {
           if (p.kind === 'char' && String(p.authorId) === key) { p.name = name; p.handle = handle }
@@ -2214,7 +2214,8 @@ function parseXPhoneOutput(raw) {
 function xPhonePrevBlock(prev) {
   var d = prev && prev.data
   if (!d) return ''
-  var feed = d.feed || []
+  // 推荐流现在会累积历史，只把「上一批」的行为传给模型，避免 token 越滚越大
+  var feed = (d.feed || []).filter(function(i) { return !i.batch || i.batch === prev.generatedAt })
   var short = function(i) { return String(i.content || '').replace(/\s+/g, ' ').slice(0, 30) }
   var liked = feed.filter(function(i) { return i.act === 'like' || i.act === 'bm' || i.act === 'rt' }).map(short)
   var skipped = feed.filter(function(i) { return i.act === 'skip' }).map(short)
@@ -2254,6 +2255,63 @@ function buildXPhoneSystemPrompt(char, acc) {
     'D§草稿 或 已删除§正文（3-5 行）\n' +
     'S§小号网名§@用户名§简介（1 行）\n' +
     'T§小号的帖子正文（2-4 行）'
+}
+
+/* ------------------ 历史累积：推荐流 / 点赞 / 小号帖子 ------------------ */
+function xPhoneKeepOld(list, snapGen) {
+  return (list || []).map(function(it) {
+    var o = Object.assign({}, it)
+    if (!o.ts) o.ts = snapGen - (o.ago || 0) * 60000
+    if (!o.batch) o.batch = snapGen
+    return o
+  })
+}
+
+function xPhoneItemKey(it) {
+  return String((it && it.content) || '').replace(/\s+/g, '').slice(0, 40)
+}
+
+// 新内容去重后放前面，旧内容保留，整体按时间倒序；不设上限
+function xPhoneMergeList(fresh, old) {
+  var seen = {}
+  old.forEach(function(it) { seen[xPhoneItemKey(it)] = true })
+  var added = fresh.filter(function(it) {
+    var k = xPhoneItemKey(it)
+    if (!k || seen[k]) return false
+    seen[k] = true
+    return true
+  })
+  return added.concat(old).sort(function(a, b) { return b.ts - a.ts })
+}
+
+// 小号帖子：旧版是字符串数组，新版是 {content, ts, name, handle}
+function xPhoneNormAltPosts(alt, gen) {
+  if (!alt || !Array.isArray(alt.posts)) return []
+  return alt.posts.map(function(p, i) {
+    var ts0 = gen - (120 + i * 900) * 60000
+    if (p && typeof p === 'object') {
+      return Object.assign({}, p, { ts: p.ts || ts0, name: p.name || alt.name, handle: p.handle || alt.handle })
+    }
+    return { content: String(p || ''), ts: ts0, name: alt.name, handle: alt.handle }
+  }).filter(function(p) { return p.content })
+}
+
+// 上午/下午 + 时间点 + 年/月/日
+function xPhoneFullTime(ts) {
+  var d = new Date(ts)
+  var h = d.getHours()
+  var mm = ('0' + d.getMinutes()).slice(-2)
+  return (h < 12 ? '上午' : '下午') + (h % 12 || 12) + ':' + mm + ' · ' +
+    d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate()
+}
+
+function xPhoneItemTime(snap, it) {
+  var ts = (it && it.ts) || ((snap.generatedAt || Date.now()) - ((it && it.ago) || 0) * 60000)
+  return xPhoneFullTime(ts)
+}
+
+function xPhoneItemTs(snap, it) {
+  return (it && it.ts) || ((snap.generatedAt || Date.now()) - ((it && it.ago) || 0) * 60000)
 }
 
 async function generateXPhoneSnapshot(ownerUid, charId) {
@@ -2330,12 +2388,34 @@ async function generateXPhoneSnapshot(ownerUid, charId) {
   var account = acc || (parsed.account ? { name: parsed.account.name, handle: parsed.account.handle } : null)
   if (!account) account = { name: charName, handle: 'user' + charId }
   var pa = parsed.account || {}
+  var now = Date.now()
+  var prevD = prev && prev.data
+  var prevGen = (prev && prev.generatedAt) || now
+
   var agos = parsed.feed.map(function() { return xRand(3, 900) }).sort(function(a, b) { return a - b })
-  parsed.feed.forEach(function(it, i) { it.ago = agos[i] })
-  parsed.likes.forEach(function(it) { it.ago = xRand(1500, 30000) })
+  parsed.feed.forEach(function(it, i) { it.ago = agos[i]; it.ts = now - agos[i] * 60000; it.batch = now })
+  parsed.likes.forEach(function(it) { it.ago = xRand(1500, 30000); it.ts = now - it.ago * 60000; it.batch = now })
   parsed.drafts.forEach(function(it) { it.ago = xRand(60, 6000) })
 
-  var now = Date.now()
+  // 推荐流 / 点赞：新内容合并进旧内容，不覆盖
+  var feedAll = xPhoneMergeList(parsed.feed.slice(0, 16), xPhoneKeepOld(prevD && prevD.feed, prevGen))
+  var likesAll = xPhoneMergeList(parsed.likes.slice(0, 14), xPhoneKeepOld(prevD && prevD.likes, prevGen))
+
+  // 小号帖子：帖子各自记着发帖的小号身份；这次没生成小号时沿用旧的
+  var prevAlt = prevD && prevD.alt
+  var altOut = null
+  if (parsed.alt) {
+    var freshAlt = parsed.altPosts.slice(0, 5).map(function(text, i) {
+      return { content: text, ts: now - (120 + i * 900) * 60000, name: parsed.alt.name, handle: parsed.alt.handle }
+    })
+    altOut = {
+      name: parsed.alt.name, handle: parsed.alt.handle, bio: parsed.alt.bio,
+      posts: xPhoneMergeList(freshAlt, xPhoneNormAltPosts(prevAlt, prevGen))
+    }
+  } else if (prevAlt) {
+    altOut = { name: prevAlt.name, handle: prevAlt.handle, bio: prevAlt.bio, posts: xPhoneNormAltPosts(prevAlt, prevGen) }
+  }
+
   var snapshot = {
     version: 1,
     generatedAt: now,
@@ -2349,11 +2429,11 @@ async function generateXPhoneSnapshot(ownerUid, charId) {
       },
       interests: parsed.interests.slice(0, 10),
       habits: parsed.habits.slice(0, 5),
-      feed: parsed.feed.slice(0, 16),
-      likes: parsed.likes.slice(0, 14),
+      feed: feedAll,
+      likes: likesAll,
       follows: parsed.follows.slice(0, 14),
       drafts: parsed.drafts.slice(0, 6),
-      alt: parsed.alt ? { name: parsed.alt.name, handle: parsed.alt.handle, bio: parsed.alt.bio, posts: parsed.altPosts.slice(0, 5) } : null
+      alt: altOut
     }
   }
   await savePhoneAppSnapshot('x', ownerUid, charId, snapshot)
@@ -2441,7 +2521,7 @@ function onXPhoneClick(e, page, st) {
     return
   }
   var act = t.dataset.act
-  if (act === 'gen') { xPhoneGenerate(page, st); return }
+  if (act === 'gen') { xPhoneOpenGenSheet(page, st); return }
   if (act === 'alt') { st.alt = !st.alt; st.tab = 'posts'; renderXPhone(page, st); return }
   if (act === 'follows') { xPhoneShowFollows(st); return }
   if (act === 'drafts') { xPhoneShowDrafts(st); return }
@@ -2462,7 +2542,32 @@ function onXPhoneClick(e, page, st) {
   }
 }
 
-async function xPhoneGenerate(page, st) {
+function xPhoneOpenGenSheet(page, st) {
+  var key = st.ctx.ownerUid + '_' + st.ctx.charId
+  if (xPhoneBusy[key]) return
+  var rowStyle = 'display:flex;align-items:center;gap:10px;padding:10px 6px;font-size:15px;cursor:pointer'
+  var mask = xOpenSheet({
+    title: '更新 TA 的 X 内容',
+    bodyHTML:
+      '<div style="padding:0 14px 6px">' +
+        '<div class="x-sheet-hint">推荐流、点赞、关注、草稿、小号会更新（旧的推荐 / 点赞 / 小号帖子会保留）。下面两项各多调用一次 AI，不勾选就只更新手机里的内容：</div>' +
+        '<label style="' + rowStyle + '"><input type="checkbox" id="x-pg-post" style="width:18px;height:18px"> 同时让 TA 在论坛发一条帖子</label>' +
+        '<label style="' + rowStyle + '"><input type="checkbox" id="x-pg-reply" style="width:18px;height:18px"> 让 TA 回复自己帖子下的评论</label>' +
+      '</div>',
+    items: [{
+      label: '开始', icon: 'fa-solid fa-wand-magic-sparkles',
+      onClick: function() {
+        xPhoneGenerate(page, st, {
+          post: !!(mask.querySelector('#x-pg-post') || {}).checked,
+          reply: !!(mask.querySelector('#x-pg-reply') || {}).checked
+        })
+      }
+    }]
+  })
+}
+
+async function xPhoneGenerate(page, st, opts) {
+  opts = opts || {}
   var key = st.ctx.ownerUid + '_' + st.ctx.charId
   if (xPhoneBusy[key]) return
   xPhoneBusy[key] = true
@@ -2471,19 +2576,129 @@ async function xPhoneGenerate(page, st) {
     if (b.classList.contains('x-phone-gen')) b.innerHTML = '<i class="fa fa-spinner fa-spin"></i> 生成中…'
   })
   try {
-    await generateXPhoneSnapshot(st.ctx.ownerUid, st.ctx.charId)
-    xToast('已更新 TA 的 X 内容')
-  } catch (e) {
-    console.warn('[x-page] 查手机 X 生成失败：', e)
-    xShowError('X 内容生成失败', e)
+    // 请求 1：手机里的内容（画像 / 推荐 / 点赞 / 关注 / 草稿 / 小号）
+    try {
+      await generateXPhoneSnapshot(st.ctx.ownerUid, st.ctx.charId)
+      xToast('已更新 TA 的 X 内容')
+    } catch (e) {
+      console.warn('[x-page] 查手机 X 生成失败：', e)
+      xShowError('X 内容生成失败', e)
+    }
+    // 请求 2、3：论坛里的帖子 / 回复，彼此独立，失败互不影响
+    if (opts.post || opts.reply) {
+      try {
+        await xPhoneForumActions(st.ctx, opts)
+      } catch (e2) {
+        console.warn('[x-page] 查手机 X 论坛操作失败：', e2)
+        xShowError('论坛操作失败', e2)
+      }
+    }
   } finally {
     xPhoneBusy[key] = false
     if (document.body.contains(page)) await renderXPhone(page, st)
   }
 }
 
-function xPhoneAgoTime(snap, ago) {
-  return xTimeLabel((snap.generatedAt || Date.now()) - (ago || 0) * 60000)
+async function xPhoneForumActions(ctx, opts) {
+  var user = await db.characters.get(ctx.ownerUid)
+  if (!user) throw new Error('微信账号不存在')
+  var data = await xGetForumFor(ctx.ownerUid)
+  var friends = await loadXFriendChars(user)
+  var ch = friends.filter(function(f) { return String(f.id) === String(ctx.charId) })[0]
+  if (!ch) throw new Error('TA 不在这个账号的好友列表里，没法在论坛发帖或回复')
+  if (opts.post) {
+    try { await generateXCharPost(user, data, ch) } catch (e) {
+      console.warn('[x-page] 角色发帖失败：', e)
+      xShowError('TA 发帖失败', e)
+    }
+  }
+  if (opts.reply) {
+    try { await generateXOwnPostReplies(user, data, ch) } catch (e2) {
+      console.warn('[x-page] 角色回复评论失败：', e2)
+      xShowError('TA 回复评论失败', e2)
+    }
+  }
+}
+
+// 角色回复自己帖子下还没回复过的评论（只调用一次 AI，最多 6 条）
+async function generateXOwnPostReplies(user, data, ch) {
+  var cid = String(ch.id)
+  var acc = ensureXAccounts(data, [ch], {})[cid]
+  var posts = data.posts.filter(function(p) { return p.kind === 'char' && String(p.authorId) === cid })
+    .sort(function(a, b) { return b.ts - a.ts }).slice(0, 3)
+
+  var items = []
+  posts.forEach(function(p, pi) {
+    var comments = p.comments || []
+    var cand = comments.filter(function(c) {
+      if (c.kind === 'char' && String(c.authorId) === cid) return false
+      if (c.kind === 'user') return false // 用户的评论由原有的回复流程处理
+      if (c.replyTo) {
+        var t = xFindComment(p, c.replyTo.id)
+        if (!t || t.kind !== 'char' || String(t.authorId) !== cid) return false
+      }
+      return !comments.some(function(x) {
+        return x.kind === 'char' && String(x.authorId) === cid && x.replyTo && x.replyTo.id === c.id
+      })
+    })
+    cand.sort(function() { return Math.random() - 0.5 }).slice(0, 3).forEach(function(c) {
+      items.push({ post: p, pi: pi, c: c })
+    })
+  })
+  items = items.slice(0, 6)
+  if (!items.length) { xToast('TA 的帖子下暂时没有需要回复的评论'); return }
+
+  var userName = getXUserName(user)
+  var system =
+    '你正在扮演角色「' + ch.charName + '」，在一个中文问答社区（风格类似小红书；界面是 X 的样子）里回复自己帖子下的评论。\n\n' +
+    '【角色设定】\n' + (ch.persona.slice(0, 1800) || '（暂无额外设定）') + (ch.role ? '\n身份：' + ch.role : '') + '\n\n' +
+    '你的 X 账号是「' + acc.name + '」@' + acc.handle + '，你是这些帖子的楼主。评论者都是不认识你的网友，你不知道他们的现实身份；不要公开「' + userName + '」的真名和隐私。\n' +
+    '请对下面编号的每一条评论各回复一条：回复 15-100 字，口吻完全符合你的人设和你发帖时的语气，口语化、像真人；' +
+    '对认真回答 / 追问你的评论要具体回应（道谢、补充细节、回答追问），对水评和抬杠可以简短带过，别客套，别 AI 腔，可带 emoji。\n\n' +
+    '【输出格式】不要 JSON、不要 markdown、不要解释；每条回复单独一行、内容不换行：\n' +
+    'R§评论编号§回复内容'
+
+  var postsSeen = {}
+  var userText = ''
+  items.forEach(function(it) {
+    if (postsSeen[it.pi]) return
+    postsSeen[it.pi] = true
+    userText += '【你的帖子' + (it.pi + 1) + '】' + String(it.post.content || '').slice(0, 400) + '\n'
+  })
+  userText += '\n【待回复的评论】\n' + items.map(function(it, i) {
+    return '[' + (i + 1) + '] 帖子' + (it.pi + 1) + '｜' + it.c.name + ' @' + stripXAt(it.c.handle) + '：' + String(it.c.content || '').slice(0, 200)
+  }).join('\n')
+
+  var raw = await callXAI(system, userText)
+  var replies = []
+  String(raw || '').replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```[a-zA-Z]*/g, '').split(/\r?\n/).forEach(function(line) {
+    line = line.trim().replace(/^(?:[-*•·]|\d+[.、)）])\s*/, '')
+    var m = line.match(/^R\s*§\s*\[?(\d+)\]?\s*§(.*)$/)
+    if (!m) return
+    var idx = parseInt(m[1], 10) - 1
+    var text = xCleanText(m[2])
+    if (items[idx] && text) replies.push({ item: items[idx], text: text })
+  })
+  if (!replies.length) throw xFormatError('模型返回的内容里没有找到评论回复', raw)
+
+  var t0 = Date.now()
+  var touched = {}
+  replies.forEach(function(r, i) {
+    var p = r.item.post
+    var c = r.item.c
+    p.comments = (p.comments || []).concat([{
+      id: xNewId('c'), kind: 'char', authorId: ch.id,
+      name: acc.name, handle: acc.handle, avatar: ch.avatar,
+      content: r.text, likes: xRand(0, 60), liked: false,
+      ts: Math.max(t0, (c.ts || 0) + 1000) + i * 800,
+      replyTo: { id: c.id, name: c.name, handle: stripXAt(c.handle) },
+      isOp: true
+    }])
+    touched[p.id] = true
+  })
+  await saveXForum(data)
+  refreshXViews(data)
+  xToast('TA 回复了 ' + replies.length + ' 条评论')
 }
 
 async function renderXPhone(page, st) {
@@ -2499,7 +2714,7 @@ async function renderXPhone(page, st) {
 
   var genBlock =
     '<button class="x-phone-gen" type="button" data-act="gen">' + (sd ? '更新 TA 的 X 内容' : '生成 TA 的 X 内容') + '</button>' +
-    '<div class="x-phone-hint">会调用一次 AI。更新时会参考上次的兴趣画像和 TA 的点击行为，推荐流会越来越贴近 TA；不会改动论坛里 TA 发过的帖子。</div>'
+    '<div class="x-phone-hint">会调用一次 AI。更新时会参考上次的兴趣画像和 TA 的点击行为，推荐流、点赞和小号帖子会累积保留。点击后可以选择是否同时让 TA 在论坛发帖、回复评论（各多调用一次 AI）。</div>'
 
   if (!acc && !sd) {
     scroll.innerHTML = '<div class="x-phone-emptywrap">' +
@@ -2536,8 +2751,11 @@ async function renderXPhone(page, st) {
   if (showAlt) {
     html += '<div class="x-phone-section">小号发过的帖子</div>'
     html += sd.alt.posts && sd.alt.posts.length
-      ? sd.alt.posts.map(function(text, i) {
-          return xPhoneCard({ avatarHTML: avatarHTML, name: name, handle: handle, time: xPhoneAgoTime(snap, 120 + i * 900), content: text })
+      ? sd.alt.posts.map(function(p, i) {
+          var pp = (p && typeof p === 'object') ? p : { content: String(p || ''), ago: 120 + i * 900 }
+          var pn = pp.name || name
+          var ph = pp.handle || handle
+          return xPhoneCard({ avatarHTML: xAvatarHTML({ name: pn }), name: pn, handle: ph, time: xPhoneItemTime(snap, pp), content: pp.content })
         }).join('')
       : xPhoneEmpty('fa-regular fa-face-meh', '小号还没发过帖子')
     scroll.innerHTML = html + genBlock
@@ -2586,12 +2804,13 @@ async function renderXPhone(page, st) {
     if (sd) {
       sd.feed.forEach(function(it) { if (it.act === 'like' || it.act === 'bm') likes.push({ it: it, tag: it.act }) })
       sd.likes.forEach(function(it) { likes.push({ it: it, tag: 'old' }) })
+      likes.sort(function(a, b) { return xPhoneItemTs(snap, b.it) - xPhoneItemTs(snap, a.it) })
     }
     html += likes.length
       ? likes.map(function(l) {
           return xPhoneCard({
             avatarHTML: xAvatarHTML({ name: l.it.name }), name: l.it.name, handle: l.it.handle,
-            time: xPhoneAgoTime(snap, l.it.ago), content: l.it.content,
+            time: xPhoneItemTime(snap, l.it), content: l.it.content,
             badge: l.tag === 'bm' ? X_PHONE_ACT_LABEL.bm : (l.tag === 'like' ? X_PHONE_ACT_LABEL.like : '')
           })
         }).join('')
@@ -2612,7 +2831,7 @@ async function renderXPhone(page, st) {
       ? sd.feed.map(function(it) {
           return xPhoneCard({
             avatarHTML: xAvatarHTML({ name: it.name }), name: it.name, handle: it.handle,
-            time: xPhoneAgoTime(snap, it.ago), content: it.content,
+            time: xPhoneItemTime(snap, it), content: it.content,
             ctx: '推荐来源：' + xEscape(it.src), badge: X_PHONE_ACT_LABEL[it.act] || ''
           })
         }).join('')
@@ -2646,7 +2865,7 @@ function xPhoneShowDrafts(st) {
       title: '草稿箱（' + list.length + '）',
       bodyHTML: '<div class="x-phone-list">' + list.map(function(d) {
         return '<div class="x-phone-draft"><div class="x-phone-draft-top"><span class="x-phone-draft-tag' + (d.kind === 'deleted' ? ' del' : '') + '">' +
-          (d.kind === 'deleted' ? '已删除' : '草稿') + '</span><span>' + xEscape(xPhoneAgoTime(snap, d.ago)) + '</span></div>' +
+          (d.kind === 'deleted' ? '已删除' : '草稿') + '</span><span>' + xEscape(xPhoneItemTime(snap, d)) + '</span></div>' +
           '<div class="x-phone-draft-text">' + formatXContent(d.content) + '</div></div>'
       }).join('') + '</div>'
     })
