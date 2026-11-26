@@ -239,7 +239,7 @@ function renderXFeed(page) {
 /* ============================================================
    论坛数据（存取）
    ============================================================ */
-async function loadXForum(user) {
+async function readXForum(user) {
   var key = X_FORUM_PREFIX + user.id
   var raw = null
   try {
@@ -284,6 +284,11 @@ async function loadXForum(user) {
     })
     await saveXForum(data)
   }
+  return data
+}
+
+async function loadXForum(user) {
+  var data = await readXForum(user)
   xForumData = data
   return data
 }
@@ -509,10 +514,10 @@ function openXPostDetail(id) {
     '</div>' +
     '<div class="x-detail-scroll"></div>' +
     '<div class="x-detail-compose">' +
-      '<div class="x-compose-target" hidden><span></span><button type="button" aria-label="取消回复"><i class="fa-solid fa-xmark"></i></button></div>' +
-      '<div class="x-compose-row">' +
-        '<input class="x-compose-input" type="text" enterkeyhint="send" maxlength="300" placeholder="发表你的评论" autocomplete="off">' +
-        '<button class="x-compose-send" type="button" disabled>发送</button>' +
+      '<div class="x-dc-target" hidden><span></span><button type="button" aria-label="取消回复"><i class="fa-solid fa-xmark"></i></button></div>' +
+      '<div class="x-dc-row">' +
+        '<input class="x-dc-input" type="text" enterkeyhint="send" maxlength="300" placeholder="发表你的评论" autocomplete="off">' +
+        '<button class="x-dc-send" type="button" disabled>发送</button>' +
       '</div>' +
     '</div>'
 
@@ -982,8 +987,8 @@ function xFindComment(post, cid) {
 
 function setXReplyTarget(page, cmt) {
   xReplyTarget = cmt ? { id: cmt.id, name: cmt.name, handle: stripXAt(cmt.handle) } : null
-  var chip = page.querySelector('.x-compose-target')
-  var input = page.querySelector('.x-compose-input')
+  var chip = page.querySelector('.x-dc-target')
+  var input = page.querySelector('.x-dc-input')
   if (chip) {
     chip.hidden = !xReplyTarget
     chip.querySelector('span').textContent = xReplyTarget ? '回复 ' + xReplyTarget.name + ' @' + xReplyTarget.handle : ''
@@ -995,9 +1000,9 @@ function setXReplyTarget(page, cmt) {
 }
 
 function bindXDetailCompose(page) {
-  var input = page.querySelector('.x-compose-input')
-  var send = page.querySelector('.x-compose-send')
-  var chip = page.querySelector('.x-compose-target')
+  var input = page.querySelector('.x-dc-input')
+  var send = page.querySelector('.x-dc-send')
+  var chip = page.querySelector('.x-dc-target')
   var bar = page.querySelector('.x-detail-compose')
   if (!input || !send) return
 
@@ -1281,11 +1286,13 @@ async function generateXCharPost(user, data, ch) {
   var userName = getXUserName(user)
   var acc = data.accounts[String(ch.id)]
   var recent = await loadXRecentChat(user, ch.id, 10, 700)
+  var interestBlock = await xInterestPromptFor(user.id, ch.id)
 
   var system =
     '你正在扮演角色「' + ch.charName + '」，在一个中文问答社区（风格类似小红书：提问求助 + 经验分享；界面是 X 的样子）上发帖。\n\n' +
     '【角色设定】\n' + (ch.persona.slice(0, 1800) || '（暂无额外设定）') +
     (ch.role ? '\n身份：' + ch.role : '') + '\n\n' +
+    interestBlock +
     '【任务】\n' +
     (isAsk
       ? '1. 以你自己的账号发 1 条「提问求助帖」（50-200 字）：结合你的人设、身份和最近的生活，提一个你真会遇到的具体问题（生活、工作学习、情感、消费、兴趣都可以），交代背景和已经尝试过的，最后明确问一句求解答。口吻完全符合你的人设。'
@@ -2095,4 +2102,553 @@ function buildXBottomBar() {
       '<span class="icon-active">' + item.activeSvg + '</span>' +
     '</div>'
   }).join('')
+}
+
+/* ============================================================
+   查手机 · X
+   读取论坛里该角色的帖子 / 回复（不花 token），
+   并可「生成 / 更新 TA 的 X 内容」：兴趣画像、为你推荐（带点击行为）、点赞、关注、草稿 / 已删除、小号。
+   更新时会把上一次的画像和行为一起传给模型 → 推荐流越来越贴近这个角色。
+   生成格式不用 JSON，用「标记§字段§字段」逐行格式。
+   由 phone-apps.js 的 PHONE_GEN_APP_OPENERS 调用 window.openPhoneXPage(context)。
+   ============================================================ */
+var X_PHONE_PAGE_ID = 'phone-app-x-page'
+var X_PHONE_ACT_MAP = { '点赞': 'like', '转发': 'rt', '收藏': 'bm', '停留': 'linger', '划走': 'skip' }
+var X_PHONE_ACT_LABEL = {
+  like: '<i class="fa-solid fa-heart"></i> TA 点赞了',
+  rt: '<i class="fa-solid fa-retweet"></i> TA 转发了',
+  bm: '<i class="fa-solid fa-bookmark"></i> TA 收藏了',
+  linger: '<i class="fa-regular fa-eye"></i> TA 停留了很久，没点',
+  skip: '<i class="fa-solid fa-angles-right"></i> TA 直接划走'
+}
+var X_PHONE_SRC_MAP = { '兴趣': '兴趣', '猜你喜欢': '猜你喜欢', '广告': '广告', '聊天相关': '聊天相关' }
+var xPhoneBusy = {}
+
+// 取某个账号的论坛数据（和论坛页共用同一份对象，避免两边写坏）
+async function xGetForumFor(ownerUid) {
+  if (xForumData && String(xForumData.uid) === String(ownerUid)) return xForumData
+  var user = await db.characters.get(ownerUid)
+  if (!user) throw new Error('微信账号不存在')
+  return await readXForum(user)
+}
+
+async function xPhoneSnapshot(ownerUid, charId) {
+  try {
+    if (typeof getPhoneAppSnapshot === 'function') return await getPhoneAppSnapshot('x', ownerUid, charId)
+  } catch (e) {}
+  return null
+}
+
+// 联动：把角色在查手机里的兴趣画像喂给论坛发帖
+async function xInterestPromptFor(ownerUid, charId) {
+  try {
+    var snap = await xPhoneSnapshot(ownerUid, charId)
+    var d = snap && snap.data
+    if (!d || !d.interests || !d.interests.length) return ''
+    var tags = d.interests.slice().sort(function(a, b) { return b.weight - a.weight }).slice(0, 8)
+      .map(function(i) { return i.tag }).join('、')
+    var habits = (d.habits || []).slice(0, 3).join('；')
+    return '【你平时在 X 上常刷、感兴趣的内容（来自你的推荐流画像）】\n兴趣：' + tags +
+      (habits ? '\n习惯：' + habits : '') + '\n发帖话题可以贴近这些兴趣，但不必硬扯。\n\n'
+  } catch (e) {
+    return ''
+  }
+}
+
+function xPhoneParseNum(v, fallback) {
+  var n = parseInt(String(v == null ? '' : v).replace(/[^\d]/g, ''), 10)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function parseXPhoneOutput(raw) {
+  var out = { account: null, interests: [], habits: [], feed: [], likes: [], follows: [], drafts: [], alt: null, altPosts: [] }
+  String(raw || '')
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .replace(/```[a-zA-Z]*/g, '')
+    .split(/\r?\n/)
+    .forEach(function(line) {
+      line = line.trim().replace(/^(?:[-*•·]|\d+[.、)）])\s*/, '')
+      var m = line.match(/^([AIHRLWDST])\s*§(.*)$/)
+      if (!m) return
+      var tag = m[1]
+      var p = m[2].split('§').map(function(s) { return s.trim() })
+      if (tag === 'A' && p.length >= 2) {
+        out.account = {
+          name: xCleanName(p[0]), handle: xCleanHandle(p[1]),
+          bio: xCleanText(p[2] || '').slice(0, 80),
+          following: xPhoneParseNum(p[3], xRand(80, 600)),
+          followers: xPhoneParseNum(p[4], xRand(20, 900))
+        }
+      } else if (tag === 'I' && p[0]) {
+        out.interests.push({ tag: p[0].slice(0, 12), weight: Math.max(1, Math.min(5, xPhoneParseNum(p[1], 3))) })
+      } else if (tag === 'H') {
+        var h = xCleanText(p.join('§')).slice(0, 80)
+        if (h) out.habits.push(h)
+      } else if (tag === 'R' && p.length >= 5) {
+        var content = xCleanText(p.slice(4).join('§'))
+        if (content) {
+          out.feed.push({
+            src: X_PHONE_SRC_MAP[p[0]] || '兴趣',
+            act: X_PHONE_ACT_MAP[p[1]] || 'skip',
+            name: xCleanName(p[2]), handle: xCleanHandle(p[3]), content: content
+          })
+        }
+      } else if (tag === 'L' && p.length >= 3) {
+        var lc = xCleanText(p.slice(2).join('§'))
+        if (lc) out.likes.push({ name: xCleanName(p[0]), handle: xCleanHandle(p[1]), content: lc })
+      } else if (tag === 'W' && p.length >= 2) {
+        out.follows.push({ name: xCleanName(p[0]), handle: xCleanHandle(p[1]), bio: xCleanText(p[2] || '').slice(0, 60) })
+      } else if (tag === 'D' && p.length >= 2) {
+        var dc = xCleanText(p.slice(1).join('§'))
+        if (dc) out.drafts.push({ kind: /删/.test(p[0]) ? 'deleted' : 'draft', content: dc })
+      } else if (tag === 'S' && p.length >= 2) {
+        out.alt = { name: xCleanName(p[0]), handle: xCleanHandle(p[1]), bio: xCleanText(p[2] || '').slice(0, 80) }
+      } else if (tag === 'T') {
+        var tc = xCleanText(p.join('§'))
+        if (tc) out.altPosts.push(tc)
+      }
+    })
+  return out
+}
+
+function xPhonePrevBlock(prev) {
+  var d = prev && prev.data
+  if (!d) return ''
+  var feed = d.feed || []
+  var short = function(i) { return String(i.content || '').replace(/\s+/g, ' ').slice(0, 30) }
+  var liked = feed.filter(function(i) { return i.act === 'like' || i.act === 'bm' || i.act === 'rt' }).map(short)
+  var skipped = feed.filter(function(i) { return i.act === 'skip' }).map(short)
+  var linger = feed.filter(function(i) { return i.act === 'linger' }).map(short)
+  return '\n\n【上一次的画像与行为（请在此基础上更新，而不是重写）】\n' +
+    '兴趣标签：' + (d.interests || []).map(function(i) { return i.tag + '(' + i.weight + ')' }).join('、') + '\n' +
+    '点击习惯：' + (d.habits || []).join('；') + '\n' +
+    '上次点赞/转发/收藏的：' + (liked.join(' / ') || '无') + '\n' +
+    '上次划走的：' + (skipped.join(' / ') || '无') + '\n' +
+    '上次停留很久的：' + (linger.join(' / ') || '无')
+}
+
+function buildXPhoneSystemPrompt(char, acc) {
+  var name = char.nick || char.name || '角色'
+  return '你在为「查手机」功能生成角色「' + name + '」的 X（推特）手机内容快照。界面是 X，社区氛围偏小红书（提问求助、经验分享很多）。' +
+    '这是用户偷偷翻看角色的手机，内容要真实、有生活感、完全符合人设，不要为了迎合用户而刻意提到用户。\n\n' +
+    '【你要生成的内容】\n' +
+    '1. 账号：' + (acc
+      ? '网名「' + acc.name + '」、用户名 @' + acc.handle + ' 必须原样使用（只补简介和数字）。'
+      : '给 TA 取一个符合人设的网名（2-8 字）和 @用户名（英文数字下划线）。') + '简介 40 字内，像真人的 X 简介。\n' +
+    '2. 兴趣画像：6-10 个兴趣标签，各带权重 1-5（5 最高），要从人设、职业、日常和最近聊天里推出来，具体到「xx 类内容」而不是泛泛的「生活」。\n' +
+    '3. 点击习惯：3-5 句，描述 TA 刷 X 的行为模式（什么时间刷、爱点开什么类型、只点赞不评论还是爱转发、会不会刷到深夜、看到与你有关的话题会不会停留等）。\n' +
+    '4. 为你推荐：10-14 条算法推给 TA 的帖子。约 65% 贴合兴趣标签；约 20% 是「猜你喜欢」，沾边但略跑偏；1-2 条广告（软文 / 带货）；1-2 条和最近聊天话题明显相关（体现算法什么都知道）。' +
+    '每条标上来源（兴趣 / 猜你喜欢 / 广告 / 聊天相关）和 TA 的行为（点赞 / 转发 / 收藏 / 停留 / 划走）。行为必须符合习惯：划走约占 30%-40%，点赞 3-5 条，收藏 1-3 条，转发 0-2 条，停留 1-2 条。帖子 30-160 字，各有口吻。\n' +
+    '5. 更早点赞过的帖子 8-12 条。\n' +
+    '6. 正在关注的账号 8-12 个（网名、用户名、一句简介），要符合兴趣；如果下面给了用户的 X 账号，TA 愿意的话可以把它也放进去。\n' +
+    '7. 草稿箱 3-5 条：没发出去的草稿或发出后又删掉的帖子，有的欲言又止，贴近人设的私密想法（可以与用户有关，也可以无关）。\n' +
+    '8. 小号：1 个小号（网名、用户名、简介）和它发过的 2-4 条帖子，是 TA 不想被熟人认出时用的号，语气和主号明显不同。\n\n' +
+    '【若给了「上一次的画像与行为」】做更新：上次点赞/收藏/转发过的类型提高权重，划走的降低权重，近期聊天里新出现的话题加入标签；保留约 60% 的旧标签；习惯微调。推荐流要换成全新的帖子。\n\n' +
+    '【输出格式】不要 JSON、不要 markdown、不要解释；每条内容单行（需要换行时写 \\n）；字段之间用 § 分隔：\n' +
+    'A§网名§@用户名§简介§关注数§关注者数\n' +
+    'I§兴趣标签§权重（6-10 行）\n' +
+    'H§一句点击习惯（3-5 行）\n' +
+    'R§来源§行为§网名§@用户名§帖子正文（10-14 行；来源只能是 兴趣/猜你喜欢/广告/聊天相关；行为只能是 点赞/转发/收藏/停留/划走）\n' +
+    'L§网名§@用户名§帖子正文（8-12 行）\n' +
+    'W§网名§@用户名§简介（8-12 行）\n' +
+    'D§草稿 或 已删除§正文（3-5 行）\n' +
+    'S§小号网名§@用户名§简介（1 行）\n' +
+    'T§小号的帖子正文（2-4 行）'
+}
+
+async function generateXPhoneSnapshot(ownerUid, charId) {
+  if (typeof window.callAI !== 'function') throw new Error('请先在设置里配置 API')
+  var char = await db.characters.get(charId)
+  if (!char) throw new Error('角色不存在')
+  var user = await db.characters.get(ownerUid)
+  if (!user) throw new Error('微信账号不存在')
+  var charName = char.nick || char.name || '角色'
+  var userName = getXUserName(user)
+  var data = await xGetForumFor(ownerUid)
+  var prev = await xPhoneSnapshot(ownerUid, charId)
+  var acc = data.accounts[String(charId)] || (prev && prev.data && prev.data.account
+    ? { name: prev.data.account.name, handle: prev.data.account.handle } : null)
+
+  // 1) 沿用其他查手机应用的上下文骨架（档案 / 关系 / NPC / 微信好友 / 世界书 / 聊天）
+  var npcs = [], recentText = '', loreMessages = [], loreCtx = '', wechatData = null
+  try { if (typeof loadPhoneSnapshotRelatedNpcs === 'function') npcs = await loadPhoneSnapshotRelatedNpcs(char, ownerUid) } catch (e) {}
+  try {
+    if (typeof buildPhoneSnapshotRecentMessagesBlock === 'function') {
+      var rb = await buildPhoneSnapshotRecentMessagesBlock(ownerUid, charId, charName, userName)
+      recentText = rb.text
+      loreMessages = rb.loreMessages
+    } else {
+      recentText = await loadXRecentChat(user, charId, 14, 900)
+    }
+  } catch (e2) {}
+  try { if (window.getLorebookContext) loreCtx = await window.getLorebookContext(charId, loreMessages) } catch (e3) {}
+  try {
+    if (typeof getPhoneWechatSnapshot === 'function') {
+      var ws = await getPhoneWechatSnapshot(ownerUid, charId)
+      wechatData = ws && ws.data
+    }
+  } catch (e4) {}
+
+  var userPrompt = ''
+  if (typeof buildPhoneAppUserPrompt === 'function') {
+    userPrompt = await buildPhoneAppUserPrompt('x', char, user, npcs, loreCtx, recentText, wechatData)
+    userPrompt = userPrompt.replace(/请严格按 system 中定义的 JSON 结构输出。\s*$/, '')
+  } else {
+    userPrompt = '【角色】' + charName + '\n人设：' + (char.description || '') + '\n\n【最近聊天】\n' + (recentText || '（无）')
+  }
+
+  // 2) 论坛里 TA 已发过的内容 + 用户的 X 账号
+  var myPosts = data.posts.filter(function(p) { return p.kind === 'char' && String(p.authorId) === String(charId) })
+    .sort(function(a, b) { return b.ts - a.ts }).slice(0, 5)
+  if (myPosts.length) {
+    userPrompt += '\n\n【TA 在论坛里发过的帖子（作为兴趣和口吻的线索，保持一致）】\n' +
+      myPosts.map(function(p) { return '· ' + String(p.content || '').replace(/\s+/g, ' ').slice(0, 80) }).join('\n')
+  }
+  try {
+    var up = await getXProfile(user)
+    userPrompt += '\n\n【用户在 X 上的账号】' + getXProfileName(user, up) + ' @' + stripXAt(getXProfileHandle(user, up)) +
+      '（用户发帖用昵称模式时，你认得出是用户本人）'
+  } catch (e5) {}
+  userPrompt += xPhonePrevBlock(prev)
+  userPrompt += '\n\n请按 system 里的逐行格式输出。'
+
+  var temp = 1.0
+  try { if (typeof getPhoneSnapshotTemperature === 'function') temp = await getPhoneSnapshotTemperature() } catch (e6) {}
+  var raw = await window.callAI([{ role: 'user', content: userPrompt }], {
+    system: buildXPhoneSystemPrompt(char, acc),
+    temperature: temp
+  })
+  if (raw && typeof raw === 'object') raw = raw.content || raw.text || JSON.stringify(raw)
+  raw = String(raw || '')
+  if (typeof stripPhoneThinking === 'function') raw = stripPhoneThinking(raw)
+
+  var parsed = parseXPhoneOutput(raw)
+  if (parsed.feed.length < 3 && parsed.interests.length < 3) {
+    throw xFormatError('模型返回的内容无法识别为 X 快照', raw)
+  }
+
+  var account = acc || (parsed.account ? { name: parsed.account.name, handle: parsed.account.handle } : null)
+  if (!account) account = { name: charName, handle: 'user' + charId }
+  var pa = parsed.account || {}
+  var agos = parsed.feed.map(function() { return xRand(3, 900) }).sort(function(a, b) { return a - b })
+  parsed.feed.forEach(function(it, i) { it.ago = agos[i] })
+  parsed.likes.forEach(function(it) { it.ago = xRand(1500, 30000) })
+  parsed.drafts.forEach(function(it) { it.ago = xRand(60, 6000) })
+
+  var now = Date.now()
+  var snapshot = {
+    version: 1,
+    generatedAt: now,
+    updatedAt: now,
+    data: {
+      account: {
+        name: account.name, handle: account.handle,
+        bio: pa.bio || (prev && prev.data && prev.data.account && prev.data.account.bio) || '',
+        following: pa.following || (parsed.follows.length + xRand(30, 300)),
+        followers: pa.followers || xRand(20, 900)
+      },
+      interests: parsed.interests.slice(0, 10),
+      habits: parsed.habits.slice(0, 5),
+      feed: parsed.feed.slice(0, 16),
+      likes: parsed.likes.slice(0, 14),
+      follows: parsed.follows.slice(0, 14),
+      drafts: parsed.drafts.slice(0, 6),
+      alt: parsed.alt ? { name: parsed.alt.name, handle: parsed.alt.handle, bio: parsed.alt.bio, posts: parsed.altPosts.slice(0, 5) } : null
+    }
+  }
+  await savePhoneAppSnapshot('x', ownerUid, charId, snapshot)
+
+  // 3) 论坛里还没有这个角色的账号 → 写回，之后在论坛发帖沿用同一个身份
+  if (!data.accounts[String(charId)]) {
+    data.accounts[String(charId)] = { name: account.name, handle: account.handle }
+    await saveXForum(data)
+  }
+  return snapshot
+}
+
+/* ------------------ 页面 ------------------ */
+function xPhoneCard(o) {
+  return '<div class="x-post x-phone-card"' + (o.openId ? ' data-open="' + xEscape(o.openId) + '"' : '') + '>' +
+    '<div class="x-post-avatar">' + o.avatarHTML + '</div>' +
+    '<div class="x-post-body">' +
+      '<div class="x-post-header">' +
+        '<span class="x-post-name">' + xEscape(o.name) + '</span>' +
+        '<span class="x-post-handle">@' + xEscape(stripXAt(o.handle)) + '</span>' +
+        (o.time ? '<span class="x-post-dot">·</span><span class="x-post-time">' + xEscape(o.time) + '</span>' : '') +
+      '</div>' +
+      (o.ctx ? '<div class="x-phone-ctx">' + o.ctx + '</div>' : '') +
+      '<div class="x-post-content">' + formatXContent(o.content) + '</div>' +
+      (o.badge ? '<div class="x-phone-badge">' + o.badge + '</div>' : '') +
+      (o.foot ? '<div class="x-phone-foot">' + o.foot + '</div>' : '') +
+    '</div>' +
+  '</div>'
+}
+
+function xPhoneEmpty(icon, text) {
+  return '<div class="x-phone-empty"><i class="' + icon + '"></i><div>' + xEscape(text) + '</div></div>'
+}
+
+async function xPhoneCharAvatar(ctx, char) {
+  try {
+    var prow = await db.config.get('wechatProfile_' + ctx.ownerUid + '_' + ctx.charId)
+    var profile = (prow && prow.value) || {}
+    return profile.avatar || (char && char.avatar) || ''
+  } catch (e) {
+    return (char && char.avatar) || ''
+  }
+}
+
+window.openPhoneXPage = async function(context) {
+  if (!context || !context.ownerUid || !context.charId) return
+  var char = await db.characters.get(context.charId)
+  var charName = (char && (char.nick || char.name)) || '角色'
+  var avatar = await xPhoneCharAvatar(context, char)
+  var existing = document.getElementById(X_PHONE_PAGE_ID)
+  if (existing) existing.remove()
+
+  var page = document.createElement('div')
+  page.id = X_PHONE_PAGE_ID
+  page.className = 'full-page x-detail-page x-phone-page'
+  page.innerHTML =
+    '<div class="x-detail-header">' +
+      '<button class="x-detail-back" type="button" aria-label="返回"><i class="fa-solid fa-arrow-left"></i></button>' +
+      '<div class="x-detail-title">' + xEscape(charName) + ' 的 X</div>' +
+      '<button class="x-phone-headgen" type="button" data-act="gen" aria-label="生成或更新"><i class="fa-solid fa-wand-magic-sparkles"></i></button>' +
+    '</div>' +
+    '<div class="x-detail-scroll"></div>'
+
+  var st = { ctx: context, char: char, charName: charName, avatar: avatar, tab: 'posts', alt: false }
+  await renderXPhone(page, st)
+
+  if (window.openPage) window.openPage(page)
+  else (document.getElementById('app') || document.body).appendChild(page)
+
+  var closeFn = function() {
+    if (window.closePage) window.closePage(X_PHONE_PAGE_ID)
+    else page.remove()
+  }
+  page.querySelector('.x-detail-back').addEventListener('click', function(e) { e.stopPropagation(); closeFn() })
+  bindXEdgeSwipe(page, closeFn)
+  page.addEventListener('click', function(e) { onXPhoneClick(e, page, st) })
+}
+
+function onXPhoneClick(e, page, st) {
+  var t = e.target.closest('[data-ptab],[data-act],[data-open]')
+  if (!t) return
+  if (t.dataset.ptab) {
+    st.tab = t.dataset.ptab
+    renderXPhone(page, st)
+    return
+  }
+  var act = t.dataset.act
+  if (act === 'gen') { xPhoneGenerate(page, st); return }
+  if (act === 'alt') { st.alt = !st.alt; st.tab = 'posts'; renderXPhone(page, st); return }
+  if (act === 'follows') { xPhoneShowFollows(st); return }
+  if (act === 'drafts') { xPhoneShowDrafts(st); return }
+  if (t.dataset.open) {
+    var pid = t.dataset.open
+    if (xForumData && String(xForumData.uid) !== String(st.ctx.ownerUid)) { xToast('这条帖子属于另一个账号的论坛'); return }
+    if (!xForumData) {
+      xGetForumFor(st.ctx.ownerUid).then(function(d) {
+        xForumData = d
+        return db.characters.get(st.ctx.ownerUid)
+      }).then(function(u) {
+        xCurrentUser = u
+        if (findXPost(pid)) openXPostDetail(pid)
+      })
+      return
+    }
+    if (findXPost(pid)) openXPostDetail(pid)
+  }
+}
+
+async function xPhoneGenerate(page, st) {
+  var key = st.ctx.ownerUid + '_' + st.ctx.charId
+  if (xPhoneBusy[key]) return
+  xPhoneBusy[key] = true
+  page.querySelectorAll('[data-act="gen"]').forEach(function(b) {
+    b.disabled = true
+    if (b.classList.contains('x-phone-gen')) b.innerHTML = '<i class="fa fa-spinner fa-spin"></i> 生成中…'
+  })
+  try {
+    await generateXPhoneSnapshot(st.ctx.ownerUid, st.ctx.charId)
+    xToast('已更新 TA 的 X 内容')
+  } catch (e) {
+    console.warn('[x-page] 查手机 X 生成失败：', e)
+    xShowError('X 内容生成失败', e)
+  } finally {
+    xPhoneBusy[key] = false
+    if (document.body.contains(page)) await renderXPhone(page, st)
+  }
+}
+
+function xPhoneAgoTime(snap, ago) {
+  return xTimeLabel((snap.generatedAt || Date.now()) - (ago || 0) * 60000)
+}
+
+async function renderXPhone(page, st) {
+  var ctx = st.ctx
+  var scroll = page.querySelector('.x-detail-scroll')
+  if (!scroll) return
+  var top = scroll.scrollTop
+  var data = await xGetForumFor(ctx.ownerUid)
+  var snap = await xPhoneSnapshot(ctx.ownerUid, ctx.charId)
+  var sd = snap && snap.data
+  var cid = String(ctx.charId)
+  var acc = data.accounts[cid] || (sd && sd.account ? { name: sd.account.name, handle: sd.account.handle } : null)
+
+  var genBlock =
+    '<button class="x-phone-gen" type="button" data-act="gen">' + (sd ? '更新 TA 的 X 内容' : '生成 TA 的 X 内容') + '</button>' +
+    '<div class="x-phone-hint">会调用一次 AI。更新时会参考上次的兴趣画像和 TA 的点击行为，推荐流会越来越贴近 TA；不会改动论坛里 TA 发过的帖子。</div>'
+
+  if (!acc && !sd) {
+    scroll.innerHTML = '<div class="x-phone-emptywrap">' +
+      xPhoneEmpty('fa-brands fa-x-twitter', 'TA 还没有 X 账号') + genBlock + '</div>'
+    return
+  }
+
+  var showAlt = st.alt && sd && sd.alt
+  var name = showAlt ? sd.alt.name : acc.name
+  var handle = showAlt ? sd.alt.handle : acc.handle
+  var bio = showAlt ? sd.alt.bio : (sd && sd.account ? sd.account.bio : '')
+  var avatarHTML = showAlt
+    ? xAvatarHTML({ name: name })
+    : xAvatarHTML({ avatar: st.avatar, name: name })
+  var color = xAvatarColor(name)
+
+  var html =
+    '<div class="x-phone-banner" style="background:linear-gradient(135deg,' + color + ',#1d9bf0)"></div>' +
+    '<div class="x-phone-profile">' +
+      '<div class="x-phone-ava">' + avatarHTML + '</div>' +
+      '<div class="x-phone-name">' + xEscape(name) + (showAlt ? '<span class="x-badge-op" style="background:#8b98a5">小号</span>' : '') + '</div>' +
+      '<div class="x-phone-handle">@' + xEscape(stripXAt(handle)) + '</div>' +
+      (bio ? '<div class="x-phone-bio">' + formatXContent(bio) + '</div>' : '') +
+      (sd && !showAlt
+        ? '<div class="x-phone-counts"><span data-act="follows"><b>' + formatXNumber(sd.account.following) + '</b> 正在关注</span><span><b>' + formatXNumber(sd.account.followers) + '</b> 关注者</span></div>'
+        : '') +
+      '<div class="x-phone-pills">' +
+        (showAlt ? '<button type="button" class="x-phone-pill" data-act="alt"><i class="fa-solid fa-rotate-left"></i> 回到主号</button>' : '') +
+        (!showAlt && sd && sd.alt ? '<button type="button" class="x-phone-pill" data-act="alt"><i class="fa-solid fa-user-secret"></i> 查看小号</button>' : '') +
+        (!showAlt && sd && sd.drafts && sd.drafts.length ? '<button type="button" class="x-phone-pill" data-act="drafts"><i class="fa-regular fa-note-sticky"></i> 草稿箱 ' + sd.drafts.length + '</button>' : '') +
+      '</div>' +
+    '</div>'
+
+  if (showAlt) {
+    html += '<div class="x-phone-section">小号发过的帖子</div>'
+    html += sd.alt.posts && sd.alt.posts.length
+      ? sd.alt.posts.map(function(text, i) {
+          return xPhoneCard({ avatarHTML: avatarHTML, name: name, handle: handle, time: xPhoneAgoTime(snap, 120 + i * 900), content: text })
+        }).join('')
+      : xPhoneEmpty('fa-regular fa-face-meh', '小号还没发过帖子')
+    scroll.innerHTML = html + genBlock
+    scroll.scrollTop = 0
+    return
+  }
+
+  var tabs = [['posts', '帖子'], ['replies', '回复'], ['likes', '点赞'], ['feed', '推荐']]
+  html += '<div class="x-phone-tabs">' + tabs.map(function(t) {
+    return '<button type="button" class="x-phone-tab' + (st.tab === t[0] ? ' active' : '') + '" data-ptab="' + t[0] + '">' + t[1] + '</button>'
+  }).join('') + '</div>'
+
+  var selfAvatar = xAvatarHTML({ avatar: st.avatar, name: acc.name })
+
+  if (st.tab === 'posts') {
+    var mine = data.posts.filter(function(p) { return p.kind === 'char' && String(p.authorId) === cid })
+      .sort(function(a, b) { return b.ts - a.ts })
+    html += mine.length
+      ? mine.map(function(p) {
+          return xPhoneCard({
+            avatarHTML: selfAvatar, name: p.name, handle: p.handle, time: xTimeLabel(p.ts), content: p.content,
+            foot: '<i class="fa-regular fa-comment"></i> ' + (p.comments ? p.comments.length : 0) + '　<i class="fa-regular fa-heart"></i> ' + formatXNumber((p.likes || 0) + (p.liked ? 1 : 0)),
+            openId: p.id
+          })
+        }).join('')
+      : xPhoneEmpty('fa-regular fa-pen-to-square', 'TA 还没在论坛发过帖子')
+  } else if (st.tab === 'replies') {
+    var rep = []
+    data.posts.forEach(function(p) {
+      ;(p.comments || []).forEach(function(c) {
+        if (c.kind === 'char' && String(c.authorId) === cid) rep.push({ p: p, c: c })
+      })
+    })
+    rep.sort(function(a, b) { return b.c.ts - a.c.ts })
+    html += rep.length
+      ? rep.map(function(r) {
+          var snip = String(r.p.content || '').replace(/\s+/g, ' ').slice(0, 40)
+          return xPhoneCard({
+            avatarHTML: selfAvatar, name: r.c.name, handle: r.c.handle, time: xTimeLabel(r.c.ts), content: r.c.content,
+            ctx: '回复 @' + xEscape(stripXAt(r.p.handle)) + '：' + xEscape(snip), openId: r.p.id
+          })
+        }).join('')
+      : xPhoneEmpty('fa-regular fa-comments', 'TA 还没在论坛评论过别人')
+  } else if (st.tab === 'likes') {
+    var likes = []
+    if (sd) {
+      sd.feed.forEach(function(it) { if (it.act === 'like' || it.act === 'bm') likes.push({ it: it, tag: it.act }) })
+      sd.likes.forEach(function(it) { likes.push({ it: it, tag: 'old' }) })
+    }
+    html += likes.length
+      ? likes.map(function(l) {
+          return xPhoneCard({
+            avatarHTML: xAvatarHTML({ name: l.it.name }), name: l.it.name, handle: l.it.handle,
+            time: xPhoneAgoTime(snap, l.it.ago), content: l.it.content,
+            badge: l.tag === 'bm' ? X_PHONE_ACT_LABEL.bm : (l.tag === 'like' ? X_PHONE_ACT_LABEL.like : '')
+          })
+        }).join('')
+      : xPhoneEmpty('fa-regular fa-heart', sd ? '暂无点赞' : '点下方按钮生成 TA 的点赞')
+  } else {
+    if (sd && sd.interests.length) {
+      html += '<div class="x-phone-section">系统给 TA 打的标签</div><div class="x-phone-chips">' +
+        sd.interests.slice().sort(function(a, b) { return b.weight - a.weight }).map(function(i) {
+          return '<span class="x-phone-chip w' + i.weight + '">' + xEscape(i.tag) + '</span>'
+        }).join('') + '</div>'
+      if (sd.habits.length) {
+        html += '<div class="x-phone-section">点击习惯</div><div class="x-phone-habits">' +
+          sd.habits.map(function(h) { return '<div>· ' + xEscape(h) + '</div>' }).join('') + '</div>'
+      }
+    }
+    html += '<div class="x-phone-section">为你推荐</div>'
+    html += sd && sd.feed.length
+      ? sd.feed.map(function(it) {
+          return xPhoneCard({
+            avatarHTML: xAvatarHTML({ name: it.name }), name: it.name, handle: it.handle,
+            time: xPhoneAgoTime(snap, it.ago), content: it.content,
+            ctx: '推荐来源：' + xEscape(it.src), badge: X_PHONE_ACT_LABEL[it.act] || ''
+          })
+        }).join('')
+      : xPhoneEmpty('fa-solid fa-wand-magic-sparkles', '点下方按钮生成 TA 的推荐流')
+  }
+
+  scroll.innerHTML = html + genBlock
+  scroll.scrollTop = top
+}
+
+function xPhoneShowFollows(st) {
+  xPhoneSnapshot(st.ctx.ownerUid, st.ctx.charId).then(function(snap) {
+    var list = (snap && snap.data && snap.data.follows) || []
+    if (!list.length) { xToast('暂无关注列表'); return }
+    xOpenSheet({
+      title: '正在关注（' + list.length + '）',
+      bodyHTML: '<div class="x-phone-list">' + list.map(function(f) {
+        return '<div class="x-phone-row"><span class="x-pick-avatar">' + xAvatarHTML({ name: f.name }) + '</span>' +
+          '<span class="x-phone-row-main"><b>' + xEscape(f.name) + '</b><small>@' + xEscape(f.handle) + '</small>' +
+          (f.bio ? '<em>' + xEscape(f.bio) + '</em>' : '') + '</span></div>'
+      }).join('') + '</div>'
+    })
+  })
+}
+
+function xPhoneShowDrafts(st) {
+  xPhoneSnapshot(st.ctx.ownerUid, st.ctx.charId).then(function(snap) {
+    var list = (snap && snap.data && snap.data.drafts) || []
+    if (!list.length) { xToast('草稿箱是空的'); return }
+    xOpenSheet({
+      title: '草稿箱（' + list.length + '）',
+      bodyHTML: '<div class="x-phone-list">' + list.map(function(d) {
+        return '<div class="x-phone-draft"><div class="x-phone-draft-top"><span class="x-phone-draft-tag' + (d.kind === 'deleted' ? ' del' : '') + '">' +
+          (d.kind === 'deleted' ? '已删除' : '草稿') + '</span><span>' + xEscape(xPhoneAgoTime(snap, d.ago)) + '</span></div>' +
+          '<div class="x-phone-draft-text">' + formatXContent(d.content) + '</div></div>'
+      }).join('') + '</div>'
+    })
+  })
 }

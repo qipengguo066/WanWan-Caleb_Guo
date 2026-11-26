@@ -629,6 +629,19 @@
       : pg.styleRule({ prefix: '· ', unit: '整篇日记', max: 2 }) + '\n'
   }
 
+// 清掉模型泄漏的思考链（<think>…</think> 等）。自带一份，不依赖 prose-guard.js 是否已部署
+  function icityStripThinking(raw) {
+    if (window.ProseGuard && window.ProseGuard.stripThinking) return window.ProseGuard.stripThinking(raw)
+    const TAGS = 'thinking|think|thought|thoughts|reasoning|reflection|analysis|scratchpad|inner_thoughts|思考|思考过程|推理|草稿'
+    let t = String(raw || '').replace(new RegExp('[＜<]\\s*(\\/?)\\s*(' + TAGS + ')\\s*[＞>]', 'gi'), '<$1$2>')
+    t = t.replace(new RegExp('<(' + TAGS + ')(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>', 'gi'), '')
+    const c = new RegExp('<\\/(' + TAGS + ')\\s*>', 'i').exec(t)
+    if (c) t = t.slice(c.index + c[0].length)
+    const o = new RegExp('<(' + TAGS + ')(?:\\s[^>]*)?>', 'i').exec(t)
+    if (o) t = t.slice(0, o.index)
+    return t.trim()
+  }
+
   async function icityPolish(text, kind) {
     const pg = window.ProseGuard
     if (!pg || !pg.isEnabled('icity') || !text) return text
@@ -796,7 +809,7 @@ ${icityProseRule('note')}· 不要输出任何双花括号包裹的模板占位�
 
   function cleanICityDiaryText(raw) {
     // 先清掉模型泄漏的思考链（<thinking>…</thinking> 等），没加载 prose-guard 时原样处理
-    let text = (window.ProseGuard && window.ProseGuard.stripThinking ? window.ProseGuard.stripThinking(raw) : String(raw || '')).trim()
+    let text = icityStripThinking(raw)
     text = text.replace(/^```[a-z]*\s*/i, '').replace(/\s*```$/, '').trim()
     // 兼容少数模型仍然返回 JSON 的情况
     if (text.startsWith('{')) {
@@ -833,7 +846,7 @@ ${icityProseRule('note')}· 不要输出任何双花括号包裹的模板占位�
 
   function parseICityNoteLines(raw) {
     const entries = []
-    ;(window.ProseGuard && window.ProseGuard.stripThinking ? window.ProseGuard.stripThinking(raw) : String(raw || '')).split(/\r?\n/).forEach(line => {
+    icityStripThinking(raw).split(/\r?\n/).forEach(line => {
       const text = line.trim()
       if (!text) return
       let m = text.match(/^回复\s*[#＃\[【]?\s*(\d+)\s*[\]】]?\s*[：:]\s*(.+)$/)
